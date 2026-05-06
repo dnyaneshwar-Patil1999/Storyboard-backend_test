@@ -32,6 +32,14 @@ from openai import AzureOpenAI
 from azure.ai.textanalytics import TextAnalyticsClient
 from azure.core.credentials import AzureKeyCredential # Added for Text Analytics client initialization
 
+# --- Cleaner-based heading detection (no LLM call) ---
+try:
+    from pdf_input_cleaner import clean_pdf_blocks, detect_pdf_headings
+    PDF_CLEANER_AVAILABLE = True
+except ImportError:
+    print("⚠️  Warning: pdf_input_cleaner not available. Will use LLM-only heading detection.")
+    PDF_CLEANER_AVAILABLE = False
+
 print("✅ Libraries imported successfully.")
 
 # ==============================================================================
@@ -824,13 +832,24 @@ def assign_context_to_elements(elements: List[Dict[str, Any]], document_outline:
 # ==============================================================================
 # --- MAIN ELEMENT EXTRACTION (Generic for Traditional Documents) ---
 # ==============================================================================
-def extract_document_elements(doc: fitz.Document, oai_client: AzureOpenAI, config: PreprocessorConfig) -> List[Dict[str, Any]]:
+def extract_document_elements(doc: fitz.Document, oai_client: AzureOpenAI, config: PreprocessorConfig, clean_blocks=None) -> List[Dict[str, Any]]:
     """
     Extracts all raw elements (text blocks, images, tables) from the document.
+    If clean_blocks is provided (from pdf_input_cleaner.clean_pdf_blocks), only
+    blocks whose (page, x0, y0) appears in clean_blocks are processed, dropping
+    web cruft and recurring headers/footers before chunks are assembled.
     """
     elements = []
-    element_counter = 0 
-    
+    element_counter = 0
+
+    # NEW: build keep-set if cleaner output was provided
+    keep_set = None
+    if clean_blocks:
+        keep_set = {
+            (cb["page"], round(cb["x0"], 1), round(cb["y0"], 1))
+            for cb in clean_blocks
+        }
+
     graph_pages_from_detector = detect_graph_pages(doc, oai_client, config) 
     
     p_fig = re.compile(r"^(figure|fig\.?)\s*([A-Z]+[-\.]?\d+|\d+[A-Z]?|\d+\.\d+|\d+-\d+|\d+[a-z]?)\)?", re.IGNORECASE)
@@ -850,6 +869,10 @@ def extract_document_elements(doc: fitz.Document, oai_client: AzureOpenAI, confi
         caption_blocks = []
         
         for b in text_blocks:
+            # NEW: skip blocks the cleaner already excluded
+            if keep_set is not None:
+                if (page_num + 1, round(b[0], 1), round(b[1], 1)) not in keep_set:
+                    continue
             block_text = b[4].strip()
             if not block_text: continue
             
@@ -1376,9 +1399,27 @@ def _process_traditional_pdf(doc: fitz.Document, blob_name: str, oai_client: Azu
     print(f"  - Processing '{blob_name}' as a TRADITIONAL DOCUMENT.")
 
     has_toc, toc_entries = detect_toc_presence(doc, oai_client, config)
-    
-    llm_derived_outline = get_llm_page_by_page_structure_traditional(doc, oai_client, config)
-            
+
+    # ── NEW: Try fast cleaner-based heading detection first (no LLM call) ──
+    cleaner_blocks = []
+    llm_derived_outline = []
+    if PDF_CLEANER_AVAILABLE:
+        cleaner_blocks = clean_pdf_blocks(doc)
+        cleaner_headings = detect_pdf_headings(cleaner_blocks)
+        for h in cleaner_headings:
+            llm_derived_outline.append({
+                "page_num": h["page"],
+                "pos":      h["pos"],
+                "level":    h["level"],
+                "text":     h["text"],
+            })
+
+    if len(llm_derived_outline) < 2:
+        print(f"  - Cleaner found {len(llm_derived_outline)} headings; falling back to per-page LLM detection.")
+        llm_derived_outline = get_llm_page_by_page_structure_traditional(doc, oai_client, config)
+    else:
+        print(f"  - Cleaner found {len(llm_derived_outline)} headings; skipping per-page LLM call.")
+
     for p_num in range(len(doc)):
         page = doc.load_page(p_num)
         for block in page.get_text("blocks", sort=True):
@@ -1398,7 +1439,7 @@ def _process_traditional_pdf(doc: fitz.Document, blob_name: str, oai_client: Azu
                 toc_chapter_map[entry['page']] = entry['title']
         toc_chapter_map = dict(sorted(toc_chapter_map.items()))
     
-    all_elements = extract_document_elements(doc, oai_client, config)
+    all_elements = extract_document_elements(doc, oai_client, config, clean_blocks=cleaner_blocks if cleaner_blocks else None)
     if not all_elements:
         print("    - No elements found in document.")
         return
